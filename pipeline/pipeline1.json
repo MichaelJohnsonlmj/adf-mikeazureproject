@@ -58,7 +58,7 @@
 						}
 					},
 					"dataset": {
-						"referenceName": "Json1",
+						"referenceName": "Json_dynamic",
 						"type": "DatasetReference"
 					},
 					"firstRowOnly": false
