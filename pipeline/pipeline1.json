@@ -173,7 +173,7 @@
 											"type": "Expression"
 										},
 										"File": {
-											"value": "@pipeline().parameters.table",
+											"value": "@concat(pipeline().parameters.table,'_',variables('current'))",
 											"type": "Expression"
 										}
 									}
