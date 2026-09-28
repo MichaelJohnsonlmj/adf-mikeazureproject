@@ -1,5 +1,5 @@
 {
-	"name": "pipeline1",
+	"name": "incremental_loader",
 	"properties": {
 		"activities": [
 			{
@@ -112,7 +112,7 @@
 						"parameters": {
 							"Container": "bronze",
 							"Folder": {
-								"value": "@pipeline().parameters.table",
+								"value": "@{pipeline().parameters.table}_cdc",
 								"type": "Expression"
 							},
 							"File": "cdc.json"
@@ -281,7 +281,7 @@
 									"parameters": {
 										"Container": "bronze",
 										"Folder": {
-											"value": "@pipeline().parameters.table",
+											"value": "@{pipeline().parameters.table}_cdc",
 											"type": "Expression"
 										},
 										"File": "empty.json"
