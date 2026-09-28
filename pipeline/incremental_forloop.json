@@ -45,7 +45,7 @@
 								"source": {
 									"type": "AzureSqlSource",
 									"sqlReaderQuery": {
-										"value": "SELECT *\nFROM @{item().schema}.@{item().table}\nWHERE @{item().cdc} >\n'@{if(\n    empty(item().from_date),\n    activity('last_cdc').output.value[0].cdc,\n    item().from_date\n)}'",
+										"value": "SELECT *\nFROM @{item().schema}.@{item().table}\nWHERE @{item().cdc_col} >\n'@{if(\n    empty(item().from_date),\n    activity('last_cdc').output.value[0].cdc,\n    item().from_date\n)}'",
 										"type": "Expression"
 									},
 									"queryTimeout": "02:00:00",
@@ -307,7 +307,7 @@
 												"parameters": {
 													"Container": "bronze",
 													"Folder": {
-														"value": "@{item().table}",
+														"value": "@{item().table}_cdc",
 														"type": "Expression"
 													},
 													"File": "cdc.json"
