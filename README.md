@@ -1,115 +1,253 @@
-# Spotify End-to-End Azure Data Engineering Project — ADF
+# Spotify Data Platform: Azure Data Factory Orchestration
 
-## Project Overview
+Parameterized, loop-driven ingestion on Azure. One pipeline loops over a list of source tables and loads each one from Azure SQL Database into ADLS Gen2, with **incremental loads**, a **backfill option** and **Logic Apps email alerts**. Adding a table means adding an entry to the list, not building a new pipeline.
 
-This repository contains the Azure Data Factory (ADF) implementation of an end-to-end Spotify data engineering project. The project demonstrates how to orchestrate data ingestion from Azure SQL Database into Azure Data Lake Storage Gen2 (ADLS Gen2), where the data can be processed and transformed using Azure Databricks.
+**Stack:** Azure Data Factory · Azure SQL Database · ADLS Gen2 · Azure Logic Apps · Azure Databricks (downstream) · GitHub
 
-The overall solution follows a medallion lakehouse architecture with Bronze, Silver, and Gold layers.
+> **Companion repo:** the Databricks side (Bronze to Silver to Gold, Delta Lake, Unity Catalog, SCD Type 2, Asset Bundles) is in [spotify-azure-data-engineering](https://github.com/MichaelJohnsonlmj/spotify-azure-data-engineering). This repo covers only the ADF ingestion layer.
+
+> **Before publishing:** search this file for `[FILL IN` and replace each marker with the real value from your ADF factory. Delete any section that doesn't match what you built.
+
+---
+
+## Table of contents
+
+1. [Architecture](#architecture)
+2. [Key features](#key-features)
+3. [Source data](#source-data)
+4. [Repository structure](#repository-structure)
+5. [Pipelines](#pipelines)
+6. [Incremental load logic](#incremental-load-logic)
+7. [Backfill](#backfill)
+8. [Looping over tables](#looping-over-tables)
+9. [Email alerting (Logic Apps)](#email-alerting-logic-apps)
+10. [Setup guide](#setup-guide)
+11. [How to run](#how-to-run)
+12. [How to add a new table](#how-to-add-a-new-table)
+13. [Challenges and lessons learned](#challenges-and-lessons-learned)
+14. [Future improvements](#future-improvements)
+15. [Acknowledgements](#acknowledgements)
+
+---
 
 ## Architecture
 
-```text
-Azure SQL Database
-        |
-        v
-Azure Data Factory
-        |
-        v
-Azure Data Lake Storage Gen2
-        |
-        v
-   Bronze Layer
-        |
-        v
- Azure Databricks
-        |
-        v
-   Silver Layer
-        |
-        v
-    Gold Layer
-        |
-        v
-Analytics and Reporting
+```mermaid
+flowchart LR
+    SQL[(Azure SQL Database<br/>DimUser, DimArtist, DimDate,<br/>DimTrack, FactStream)]
+
+    subgraph ADF[Azure Data Factory]
+        P[Parameterized ingestion pipeline]
+        F[ForEach: one run per table]
+        C[Copy activity]
+    end
+
+    subgraph Lake[ADLS Gen2]
+        B[Bronze container]
+    end
+
+    DBX[Azure Databricks<br/>Silver and Gold<br/>see companion repo]
+    LA[Logic App]
+    MAIL[Email]
+
+    SQL --> C
+    P --> F --> C --> B --> DBX
+    P -- failure or status --> LA --> MAIL
 ```
 
-## Technologies Used
+**Data flow**
 
-* **Azure Data Factory:** Pipeline orchestration and data ingestion.
-* **Azure SQL Database:** Source database containing Spotify-related data.
-* **Azure Data Lake Storage Gen2:** Scalable cloud storage for the data lake.
-* **Azure Databricks:** Data transformation and lakehouse processing.
-* **GitHub:** Source control and project documentation.
+1. The pipeline receives a list of source tables (and the load mode) as parameters.
+2. A **ForEach** loop runs the same Copy logic for each table.
+3. Each table is copied from Azure SQL Database into the **Bronze** container in ADLS Gen2.
+4. Databricks picks up the Bronze files with Auto Loader (see the companion repo).
+5. A **Logic App** sends an email with the pipeline status.
 
-## Source Data
+---
 
-The project works with the following Spotify-related tables:
+## Key features
 
-* `DimUser`
-* `DimArtist`
-* `DimDate`
-* `DimTrack`
-* `FactStream`
+- **Parameterized pipelines:** table names and load settings are parameters, so nothing is hardcoded per table.
+- **ForEach looping:** one pipeline handles all 5 source tables.
+- **Incremental ingestion:** only new or changed rows are copied after the first load. [FILL IN: watermark column or CDC method]
+- **Backfill option:** a parameter lets you reload historical data on demand without editing the pipeline.
+- **Email alerts:** Logic Apps sends a status email for each run.
+- **Source control:** the factory is connected to GitHub, so every pipeline, dataset and linked service is versioned in this repo.
+- **Separation of concerns:** ADF handles ingestion and orchestration. Databricks handles transformation.
 
-These tables represent user, artist, date, track, and streaming activity data.
+---
 
-## Key Features
+## Source data
 
-### 1. Data Ingestion and Orchestration
+Azure SQL Database holds five Spotify-style tables.
 
-* Configured Azure Data Factory to orchestrate data movement from Azure SQL Database to ADLS Gen2.
-* Organized pipeline components to support the ingestion workflow.
-* Integrated ADF with Azure storage and downstream Databricks processing.
+| Table | Type | Description |
+|---|---|---|
+| `DimUser` | Dimension | Listener profile data |
+| `DimArtist` | Dimension | Artist details |
+| `DimTrack` | Dimension | Track details |
+| `DimDate` | Dimension | Calendar attributes |
+| `FactStream` | Fact | Individual streaming events |
 
-### 2. Data Lake Integration
+> The data is synthetic or sample data. No real user data is used.
 
-* Used ADLS Gen2 as the central storage layer for ingested data.
-* Organized data into the Bronze, Silver, and Gold lakehouse layers.
-* Enabled downstream processing through Azure Databricks.
+---
 
-### 3. Databricks Integration
+## Repository structure
 
-Azure Data Factory forms the ingestion and orchestration component of the overall solution. The separate Databricks implementation handles data cleansing, deduplication, Delta Lake processing, and Gold-layer transformations.
+> Adjust to match your repo.
 
-### 4. Source Control
+```
+.
+├── pipeline/          # ADF pipeline JSON
+├── dataset/           # ADF datasets (parameterized)
+├── linkedService/     # Linked services (no secrets)
+├── factory/           # Global parameters
+├── docs/              # Architecture diagram and screenshots
+└── README.md
+```
 
-* Maintained the ADF implementation in GitHub.
-* Documented the project architecture and implementation.
-* Kept the ADF and Databricks components in separate repositories for easier organization.
+---
 
-## End-to-End Data Flow
+## Pipelines
 
-1. **Source:** Spotify-related data is stored in Azure SQL Database.
-2. **Ingestion:** Azure Data Factory orchestrates the movement of source data.
-3. **Landing and Bronze:** Data is stored in ADLS Gen2 for downstream processing.
-4. **Silver:** Azure Databricks cleans and transforms the ingested data.
-5. **Gold:** Curated data is prepared for analytics and reporting.
-6. **Consumption:** Gold-layer data can be used by reporting tools such as Power BI.
+| Pipeline | Role | Parameters |
+|---|---|---|
+| [FILL IN: main pipeline name] | Entry point. Loops over the table list and runs the copy logic for each table. | [FILL IN: for example table list, load mode, backfill flag] |
+| [FILL IN: alert pipeline or activity name] | Calls the Logic App to send the status email. | [FILL IN] |
 
-## Related Repository
+### Activity flow
 
-The Databricks transformations and lakehouse implementation are maintained in a separate repository:
+```
+[FILL IN: Lookup / Set variable / If condition, if used]
+        ▼
+ForEach (table list)
+        ▼
+   Copy: Azure SQL ─► ADLS Gen2 Bronze
+        ▼
+Web activity ─► Logic App (email)
+```
 
-**[Spotify Azure Data Engineering — Databricks Repository](https://github.com/MichaelJohnsonlmj/spotify-azure-data-engineering)**
+---
 
-## Project Objectives
+## Incremental load logic
 
-* Develop practical experience with Azure Data Factory.
-* Understand cloud data ingestion and orchestration.
-* Integrate Azure SQL Database with ADLS Gen2.
-* Understand the responsibilities of Bronze, Silver, and Gold layers.
-* Practice source control and documentation for data engineering projects.
-* Build a portfolio project demonstrating Azure data engineering concepts.
+[FILL IN: describe how your pipeline decides what to copy. Use the one that matches your build.]
 
-## Security Considerations
+- **Watermark approach:** the last loaded value of `[FILL IN: column]` is stored in `[FILL IN: where]`. Each run copies only rows with a higher value, then updates the stored value after a successful copy.
+- **CDC approach:** [FILL IN: how changes are detected and where the state is kept]
+- **First run:** loads the full table.
 
-* Do not commit passwords, access keys, tokens, or connection strings.
-* Store credentials securely using appropriate Azure security services.
-* Use managed identities and least-privilege access where supported.
-* Use synthetic or sample data for public demonstrations.
+---
+
+## Backfill
+
+A backfill parameter reloads historical data without changing the pipeline.
+
+- **How it works:** [FILL IN: for example, when the parameter is set, the pipeline ignores the stored watermark and uses the start date you pass in]
+- **When to use it:** after a failed load, a source correction, or when onboarding a table with history.
+- **How to run it:** trigger the pipeline and set `[FILL IN: parameter name]` to `[FILL IN: value]`.
+
+---
+
+## Looping over tables
+
+The pipeline uses a **ForEach** activity over an array parameter, for example:
+
+```json
+[FILL IN: your real array, for example table names and any per-table settings]
+```
+
+Each iteration passes the table name into a parameterized dataset, so one Copy activity serves all five tables. Set the ForEach to run in parallel (`isSequential = false`) with a `batchCount` of `[FILL IN]`.
+
+---
+
+## Email alerting (Logic Apps)
+
+The pipeline calls an HTTP-triggered Logic App with a **Web activity** (`POST`, `Content-Type: application/json`).
+
+```json
+{
+  "subject": "[FILL IN: example subject]",
+  "pipeline": "[FILL IN]",
+  "status": "[FILL IN]",
+  "run_id": "[FILL IN]"
+}
+```
+
+- The Logic App formats the message and sends it by email.
+- The Logic App URL contains a signature. Keep it in a global parameter or Key Vault, never in the repo.
+
+---
+
+## Setup guide
+
+### Prerequisites
+
+- Azure subscription
+- Azure Data Factory, Azure SQL Database, ADLS Gen2, Logic App
+- Azure Databricks workspace (for the downstream layers)
+- GitHub repo connected to ADF (Git integration)
+
+### Steps
+
+1. **Storage:** create the ADLS Gen2 account and a `bronze` container.
+2. **Azure SQL:** create the database and load the five source tables.
+3. **ADF:** create linked services (Azure SQL, ADLS Gen2), then parameterized datasets, then import the pipelines from this repo.
+4. **Logic App:** create the HTTP-triggered workflow and put its URL in a global parameter.
+5. **Git:** connect the factory to this repo and publish from the collaboration branch.
+6. **Security:** use managed identity or Key Vault for credentials. Don't commit connection strings.
+
+---
+
+## How to run
+
+1. Open ADF Studio, go to **Author**, then the main pipeline.
+2. Click **Add trigger**, then **Trigger now**, and set the parameters.
+3. Watch **Monitor**, then **Pipeline runs**.
+4. For a historical reload, set the backfill parameter (see [Backfill](#backfill)).
+
+---
+
+## How to add a new table
+
+1. Create the table in Azure SQL Database.
+2. Add the table to the ForEach list parameter. [FILL IN: and any per-table settings]
+3. Run the pipeline. No new pipeline or dataset is needed.
+
+---
+
+## Challenges and lessons learned
+
+> Replace this with 3 to 5 problems you actually hit. Real examples impress recruiters more than anything else in this README.
+
+| Problem | Cause | Fix |
+|---|---|---|
+| [FILL IN] | [FILL IN] | [FILL IN] |
+| [FILL IN] | [FILL IN] | [FILL IN] |
+| [FILL IN] | [FILL IN] | [FILL IN] |
+
+---
+
+## Future improvements
+
+- Control and audit tables in Azure SQL to log every run and table
+- Data quality checks before the data reaches Bronze
+- Retry policies and alert escalation for repeated failures
+- Automated deployment of the factory between Dev, Test and Prod
+- Parameterized scheduling with a daily trigger
+
+---
+
+## Acknowledgements
+
+> If you built this project by following a course or tutorial, say so here and name it. Then list what you added or changed. Recruiters value this honesty.
+
+Built following [FILL IN: course or tutorial name, if any]. Changes and additions of my own: [FILL IN].
+
+---
 
 ## Author
 
-**Michael Johnson Louis**
-
-Azure Data Engineering | SQL | Python | Azure Data Factory | Azure Databricks | PySpark | Delta Lake
+**Michael Johnson Louis**: Azure Data Engineer
+[LinkedIn](https://www.linkedin.com/in/michael-johnson-louis-0321b5b4/) · [GitHub](https://github.com/MichaelJohnsonlmj)
