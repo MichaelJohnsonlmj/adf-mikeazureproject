@@ -1,12 +1,10 @@
 # Spotify Data Platform: Azure Data Factory Orchestration
 
-Parameterized, loop-driven ingestion on Azure. One pipeline loops over a list of source tables and loads each one from Azure SQL Database into ADLS Gen2, with **incremental loads**, a **backfill option** and **Logic Apps email alerts**. Adding a table means adding an entry to the list, not building a new pipeline.
+Parameterized, incremental ingestion on Azure. One pipeline loops over a list of source tables and loads only new or changed rows from Azure SQL Database into the Bronze layer of ADLS Gen2 as Parquet. It tracks a **change-column watermark** per table, supports a **per-table backfill date**, and cleans up after runs that find no new data. Adding a table means adding one entry to the table list, not building a new pipeline.
 
 **Stack:** Azure Data Factory · Azure SQL Database · ADLS Gen2 · Azure Logic Apps · Azure Databricks (downstream) · GitHub
 
-> **Companion repo:** the Databricks side (Bronze to Silver to Gold, Delta Lake, Unity Catalog, SCD Type 2, Asset Bundles) is in [spotify-azure-data-engineering](https://github.com/MichaelJohnsonlmj/spotify-azure-data-engineering). This repo covers only the ADF ingestion layer.
-
-> **Before publishing:** search this file for `[FILL IN` and replace each marker with the real value from your ADF factory. Delete any section that doesn't match what you built.
+> **Companion repo:** the Databricks side (Bronze to Silver to Gold, Auto Loader, Delta Lake, Unity Catalog, SCD Type 2, Asset Bundles) is in [spotify-azure-data-engineering](https://github.com/MichaelJohnsonlmj/spotify-azure-data-engineering). This repo covers only the ADF ingestion layer.
 
 ---
 
@@ -24,9 +22,8 @@ Parameterized, loop-driven ingestion on Azure. One pipeline loops over a list of
 10. [Setup guide](#setup-guide)
 11. [How to run](#how-to-run)
 12. [How to add a new table](#how-to-add-a-new-table)
-13. [Challenges and lessons learned](#challenges-and-lessons-learned)
+13. [Design decisions](#design-decisions)
 14. [Future improvements](#future-improvements)
-15. [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -36,44 +33,48 @@ Parameterized, loop-driven ingestion on Azure. One pipeline loops over a list of
 flowchart LR
     SQL[(Azure SQL Database<br/>DimUser, DimArtist, DimDate,<br/>DimTrack, FactStream)]
 
-    subgraph ADF[Azure Data Factory]
-        P[Parameterized ingestion pipeline]
-        F[ForEach: one run per table]
-        C[Copy activity]
+    subgraph ADF[Azure Data Factory: incremental_forloop]
+        FE[ForEach: one table at a time]
+        LK["Lookup last_cdc<br/>bronze/table_cdc/cdc.json"]
+        CP["Copy: rows where cdc_col is newer<br/>than last cdc or from_date"]
+        IF{"dataRead > 0 ?"}
+        MX["Script max_cdc"]
+        UP["Copy: write new cdc.json"]
+        DEL["Delete empty file"]
     end
 
-    subgraph Lake[ADLS Gen2]
-        B[Bronze container]
-    end
-
+    B[("ADLS Gen2 Bronze<br/>table / table_timestamp (Parquet)")]
     DBX[Azure Databricks<br/>Silver and Gold<br/>see companion repo]
-    LA[Logic App]
-    MAIL[Email]
 
-    SQL --> C
-    P --> F --> C --> B --> DBX
-    P -- failure or status --> LA --> MAIL
+    SQL --> CP
+    FE --> LK --> CP --> IF
+    CP --> B --> DBX
+    IF -- yes --> MX --> UP
+    IF -- no --> DEL
 ```
 
 **Data flow**
 
-1. The pipeline receives a list of source tables (and the load mode) as parameters.
-2. A **ForEach** loop runs the same Copy logic for each table.
-3. Each table is copied from Azure SQL Database into the **Bronze** container in ADLS Gen2.
-4. Databricks picks up the Bronze files with Auto Loader (see the companion repo).
-5. A **Logic App** sends an email with the pipeline status.
+1. The pipeline receives an array of tables. Each entry holds the schema, table, change column and an optional `from_date`.
+2. The **ForEach** loop takes one table at a time.
+3. A **Lookup** reads the last loaded watermark from `bronze/<table>_cdc/cdc.json`.
+4. A **Copy** reads only rows newer than that watermark and writes a timestamped Parquet file to `bronze/<table>/`.
+5. If rows were read, a **Script** finds the new maximum change value and a **Copy** saves it as the next watermark. If no rows were read, the empty file is deleted and the watermark is left unchanged.
+6. Databricks picks up the Bronze files with Auto Loader (see the companion repo).
 
 ---
 
 ## Key features
 
-- **Parameterized pipelines:** table names and load settings are parameters, so nothing is hardcoded per table.
-- **ForEach looping:** one pipeline handles all 5 source tables.
-- **Incremental ingestion:** only new or changed rows are copied after the first load. [FILL IN: watermark column or CDC method]
-- **Backfill option:** a parameter lets you reload historical data on demand without editing the pipeline.
-- **Email alerts:** Logic Apps sends a status email for each run.
-- **Source control:** the factory is connected to GitHub, so every pipeline, dataset and linked service is versioned in this repo.
-- **Separation of concerns:** ADF handles ingestion and orchestration. Databricks handles transformation.
+- **Parameterized and loop-driven:** one pipeline serves all 5 tables, driven by an array parameter (`forloo`).
+- **Incremental ingestion:** a per-table watermark stored as `cdc.json` in ADLS means each run copies only new or changed rows.
+- **Per-table change columns:** `updated_at` for most tables, `date` for `DimDate` and `stream_timestamp` for `FactStream`.
+- **Backfill on demand:** setting `from_date` for a table overrides the stored watermark, so history can be reloaded without editing the pipeline.
+- **Clean empty runs:** if a table has no new rows, the empty Parquet file is deleted and the watermark is not moved.
+- **Reusable single-table pipeline:** `incremental_loader` runs the same logic for one table through pipeline parameters.
+- **Email alerts:** Azure Logic Apps sends a status email for pipeline runs.
+- **Source control:** the factory is connected to GitHub, so pipelines, datasets and linked services are versioned in this repo.
+- **Separation of concerns:** ADF handles ingestion. Databricks handles transformation.
 
 ---
 
@@ -81,13 +82,13 @@ flowchart LR
 
 Azure SQL Database holds five Spotify-style tables.
 
-| Table | Type | Description |
+| Table | Type | Change column |
 |---|---|---|
-| `DimUser` | Dimension | Listener profile data |
-| `DimArtist` | Dimension | Artist details |
-| `DimTrack` | Dimension | Track details |
-| `DimDate` | Dimension | Calendar attributes |
-| `FactStream` | Fact | Individual streaming events |
+| `DimUser` | Dimension | `updated_at` |
+| `DimTrack` | Dimension | `updated_at` |
+| `DimArtist` | Dimension | `updated_at` |
+| `DimDate` | Dimension | `date` |
+| `FactStream` | Fact | `stream_timestamp` |
 
 > The data is synthetic or sample data. No real user data is used.
 
@@ -95,13 +96,11 @@ Azure SQL Database holds five Spotify-style tables.
 
 ## Repository structure
 
-> Adjust to match your repo.
-
 ```
 .
-├── pipeline/          # ADF pipeline JSON
-├── dataset/           # ADF datasets (parameterized)
-├── linkedService/     # Linked services (no secrets)
+├── pipeline/          # incremental_forloop.json, incremental_loader.json
+├── dataset/           # azure_sql, parquet_dynamic, Json_dynamic
+├── linkedService/     # Azure SQL and ADLS Gen2 (no secrets)
 ├── factory/           # Global parameters
 ├── docs/              # Architecture diagram and screenshots
 └── README.md
@@ -113,70 +112,90 @@ Azure SQL Database holds five Spotify-style tables.
 
 | Pipeline | Role | Parameters |
 |---|---|---|
-| [FILL IN: main pipeline name] | Entry point. Loops over the table list and runs the copy logic for each table. | [FILL IN: for example table list, load mode, backfill flag] |
-| [FILL IN: alert pipeline or activity name] | Calls the Logic App to send the status email. | [FILL IN] |
+| `incremental_forloop` | Main pipeline. Loops over the table list and runs the incremental copy logic for each table, one at a time. | `forloo` (array of `schema`, `table`, `cdc_col`, `from_date`) |
+| `incremental_loader` | Single-table version of the same logic. Takes the table settings as individual parameters. | `schema`, `table`, `cdc_col`, `from_date` |
 
-### Activity flow
+### Datasets and linked service
+
+| Name | Type | Purpose |
+|---|---|---|
+| `azure_sql` | Azure SQL dataset | Source for the Copy activity |
+| `parquet_dynamic` | Parquet dataset (parameters: `Container`, `Folder`, `File`) | Bronze output, one folder per table |
+| `Json_dynamic` | JSON dataset (parameters: `Container`, `Folder`, `File`) | Reads and writes the `cdc.json` watermark |
+| `AzureSqlDatabase1` | Linked service | Runs the `max_cdc` query |
+
+### Activity flow (per table)
 
 ```
-[FILL IN: Lookup / Set variable / If condition, if used]
-        ▼
-ForEach (table list)
-        ▼
-   Copy: Azure SQL ─► ADLS Gen2 Bronze
-        ▼
-Web activity ─► Logic App (email)
+last_cdc (Lookup)  ─┐
+                    ├─► AzureSqltoLake (Copy) ─► incremental_if (If: dataRead > 0)
+current (Set var)  ─┘                                 ├─ true : max_cdc (Script) ─► updated_last_cdc (Copy)
+                                                      └─ false: Delete empty file
 ```
 
 ---
 
 ## Incremental load logic
 
-[FILL IN: describe how your pipeline decides what to copy. Use the one that matches your build.]
+The pipeline uses a **high-watermark on a change column**.
 
-- **Watermark approach:** the last loaded value of `[FILL IN: column]` is stored in `[FILL IN: where]`. Each run copies only rows with a higher value, then updates the stored value after a successful copy.
-- **CDC approach:** [FILL IN: how changes are detected and where the state is kept]
-- **First run:** loads the full table.
+1. **Read the watermark:** the `last_cdc` Lookup reads `bronze/<table>_cdc/cdc.json`.
+2. **Copy only newer rows:** the source query is built from the table settings:
+
+   ```sql
+   SELECT *
+   FROM <schema>.<table>
+   WHERE <cdc_col> > '<from_date if provided, otherwise the last cdc>'
+   ```
+
+3. **Write to Bronze:** rows land as Parquet in `bronze/<table>/`, in a file named `<table>_<utc timestamp>`.
+4. **Advance the watermark:** only when `dataRead > 0`, a Script activity runs `SELECT MAX(<cdc_col>)` and a Copy writes that value to `cdc.json`. The next run starts from there.
+5. **No new data:** the empty Parquet file is deleted and the watermark stays where it was.
 
 ---
 
 ## Backfill
 
-A backfill parameter reloads historical data without changing the pipeline.
+Each entry in the table list has a `from_date` field.
 
-- **How it works:** [FILL IN: for example, when the parameter is set, the pipeline ignores the stored watermark and uses the start date you pass in]
-- **When to use it:** after a failed load, a source correction, or when onboarding a table with history.
-- **How to run it:** trigger the pipeline and set `[FILL IN: parameter name]` to `[FILL IN: value]`.
+- **Normal run:** leave `from_date` empty (`""`). The pipeline uses the stored watermark.
+- **Backfill:** set `from_date` to a historical date for the table you want to reload. The pipeline then ignores the stored watermark and copies every row newer than that date.
+- **What it does not do:** it doesn't delete anything already in Bronze, so a backfill can write rows that already exist. The Silver layer deduplicates them in Databricks.
+- **After a backfill:** the watermark moves to the latest change value, so normal incremental runs continue from there.
+
+Example entry:
+
+```json
+{ "schema": "dbo", "table": "DimUser", "cdc_col": "updated_at", "from_date": "2024-01-01" }
+```
 
 ---
 
 ## Looping over tables
 
-The pipeline uses a **ForEach** activity over an array parameter, for example:
+The `forloo` array parameter drives a **ForEach** activity. Default value:
 
 ```json
-[FILL IN: your real array, for example table names and any per-table settings]
+[
+  { "schema": "dbo", "table": "DimUser",    "cdc_col": "updated_at",       "from_date": "" },
+  { "schema": "dbo", "table": "DimTrack",   "cdc_col": "updated_at",       "from_date": "" },
+  { "schema": "dbo", "table": "DimDate",    "cdc_col": "date",             "from_date": "" },
+  { "schema": "dbo", "table": "DimArtist",  "cdc_col": "updated_at",       "from_date": "" },
+  { "schema": "dbo", "table": "FactStream", "cdc_col": "stream_timestamp", "from_date": "" }
+]
 ```
 
-Each iteration passes the table name into a parameterized dataset, so one Copy activity serves all five tables. Set the ForEach to run in parallel (`isSequential = false`) with a `batchCount` of `[FILL IN]`.
+Each iteration passes `item().table`, `item().schema` and `item().cdc_col` into the Lookup, Copy and Script activities and into the parameterized datasets, so the same activities serve every table.
+
+The loop runs **sequentially** (`isSequential = true`). The pipeline variable `current` holds the run timestamp, and variables are shared across iterations, so parallel iterations could overwrite each other's value.
 
 ---
 
 ## Email alerting (Logic Apps)
 
-The pipeline calls an HTTP-triggered Logic App with a **Web activity** (`POST`, `Content-Type: application/json`).
+Azure Logic Apps sends an email with the pipeline status, so a run doesn't need to be watched in ADF Monitor.
 
-```json
-{
-  "subject": "[FILL IN: example subject]",
-  "pipeline": "[FILL IN]",
-  "status": "[FILL IN]",
-  "run_id": "[FILL IN]"
-}
-```
-
-- The Logic App formats the message and sends it by email.
-- The Logic App URL contains a signature. Keep it in a global parameter or Key Vault, never in the repo.
+> The Logic App URL contains a signature. Keep it in a global parameter or Key Vault, never in the repo.
 
 ---
 
@@ -193,57 +212,55 @@ The pipeline calls an HTTP-triggered Logic App with a **Web activity** (`POST`, 
 
 1. **Storage:** create the ADLS Gen2 account and a `bronze` container.
 2. **Azure SQL:** create the database and load the five source tables.
-3. **ADF:** create linked services (Azure SQL, ADLS Gen2), then parameterized datasets, then import the pipelines from this repo.
-4. **Logic App:** create the HTTP-triggered workflow and put its URL in a global parameter.
-5. **Git:** connect the factory to this repo and publish from the collaboration branch.
-6. **Security:** use managed identity or Key Vault for credentials. Don't commit connection strings.
+3. **Seed the watermark:** for each table, create `bronze/<table>_cdc/cdc.json` containing a `cdc` value with an early date, for example `1900-01-01`. The `last_cdc` Lookup reads this file, so it must exist before the first run.
+4. **ADF:** create the linked services (Azure SQL, ADLS Gen2) and the three parameterized datasets, then import the pipelines from this repo.
+5. **Logic App:** create the HTTP-triggered workflow and put its URL in a global parameter.
+6. **Git:** connect the factory to this repo and publish from the collaboration branch.
+7. **Security:** use managed identity or Key Vault for credentials. Don't commit connection strings.
 
 ---
 
 ## How to run
 
-1. Open ADF Studio, go to **Author**, then the main pipeline.
-2. Click **Add trigger**, then **Trigger now**, and set the parameters.
+1. Open ADF Studio, go to **Author**, then `incremental_forloop`.
+2. Click **Add trigger**, then **Trigger now**. Keep the default table list, or edit it.
 3. Watch **Monitor**, then **Pipeline runs**.
-4. For a historical reload, set the backfill parameter (see [Backfill](#backfill)).
+4. For a historical reload, set `from_date` on the table (see [Backfill](#backfill)).
+5. Check `bronze/<table>/` for the new Parquet file and `bronze/<table>_cdc/cdc.json` for the updated watermark.
 
 ---
 
 ## How to add a new table
 
-1. Create the table in Azure SQL Database.
-2. Add the table to the ForEach list parameter. [FILL IN: and any per-table settings]
-3. Run the pipeline. No new pipeline or dataset is needed.
+1. Create the table in Azure SQL Database. It needs a change column that increases when a row changes.
+2. Seed `bronze/<table>_cdc/cdc.json` with an early date.
+3. Add `{ "schema": ..., "table": ..., "cdc_col": ..., "from_date": "" }` to the `forloo` list.
+4. Run the pipeline. No new pipeline or dataset is needed.
 
 ---
 
-## Challenges and lessons learned
+## Design decisions
 
-> Replace this with 3 to 5 problems you actually hit. Real examples impress recruiters more than anything else in this README.
-
-| Problem | Cause | Fix |
-|---|---|---|
-| [FILL IN] | [FILL IN] | [FILL IN] |
-| [FILL IN] | [FILL IN] | [FILL IN] |
-| [FILL IN] | [FILL IN] | [FILL IN] |
+| Decision | Reason |
+|---|---|
+| Keep the watermark as a `cdc.json` file in the lake | State sits next to the data and needs no extra database |
+| Advance the watermark only when `dataRead > 0` | A run that finds nothing never moves the watermark |
+| Delete the empty Parquet file on no-data runs | Keeps zero-row files out of Bronze, so Auto Loader doesn't pick them up |
+| Run the ForEach sequentially | The `current` timestamp variable is shared across iterations |
+| Put `cdc_col` and `from_date` in each table entry | Tables use different change columns, and each can be backfilled on its own |
+| Use parameterized datasets (`Container`, `Folder`, `File`) | One Parquet dataset and one JSON dataset serve every table |
 
 ---
 
 ## Future improvements
 
-- Control and audit tables in Azure SQL to log every run and table
+- Make `incremental_forloop` call `incremental_loader` with an Execute Pipeline activity, so the incremental logic lives in one place
+- Add retry policies (all activities currently use `retry = 0`)
+- Take the new watermark from the rows just copied, not from a separate `MAX` query, so rows inserted between the copy and the query can't be skipped
+- Control and audit tables in Azure SQL, so the table list and every run are stored in a database instead of a pipeline parameter
 - Data quality checks before the data reaches Bronze
-- Retry policies and alert escalation for repeated failures
+- Parallel table loading, which first needs the `current` timestamp to be per-iteration
 - Automated deployment of the factory between Dev, Test and Prod
-- Parameterized scheduling with a daily trigger
-
----
-
-## Acknowledgements
-
-> If you built this project by following a course or tutorial, say so here and name it. Then list what you added or changed. Recruiters value this honesty.
-
-Built following [FILL IN: course or tutorial name, if any]. Changes and additions of my own: [FILL IN].
 
 ---
 
